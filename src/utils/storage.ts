@@ -29,6 +29,7 @@ export const DEFAULT_ACTIVE_SESSION: ActiveSessionState = {
   accumulatedMs: 0,
   intervals: [],
   notes: '',
+  lastHeartbeat: undefined,
 };
 
 /**
@@ -110,6 +111,7 @@ export const StorageService = {
         accumulatedMs: typeof saved.accumulatedMs === 'number' ? Math.max(0, saved.accumulatedMs) : 0,
         intervals: Array.isArray(saved.intervals) ? saved.intervals : [],
         notes: saved.notes || '',
+        lastHeartbeat: typeof saved.lastHeartbeat === 'number' ? saved.lastHeartbeat : undefined,
       };
     } catch {
       return { ...DEFAULT_ACTIVE_SESSION };

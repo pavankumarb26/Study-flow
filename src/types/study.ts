@@ -32,6 +32,7 @@ export interface ActiveSessionState {
   accumulatedMs: number;               // Sum of completed intervals in current session
   intervals: StudyInterval[];          // Completed intervals in current session
   notes: string;
+  lastHeartbeat?: number;              // Timestamp of last active tick/interaction
 }
 
 export interface UserSettings {

@@ -18,6 +18,7 @@ import {
   getMonthStudyTimeMs,
   getLast7DaysSummary,
   getSubjectBreakdown,
+  processDailyRollover,
 } from '../utils/dateUtils';
 import { soundFx } from '../utils/sound';
 import confetti from 'canvas-confetti';
@@ -66,35 +67,65 @@ interface StudyContextType {
   subjectBreakdown: SubjectStudySummary[];
   recentSessions: StudySession[];
 
-  // Current calendar day state
+  // Current calendar day state & notices
   currentDateStr: string;
   refreshCalculations: () => void;
+  rolloverNotice: string | null;
+  clearRolloverNotice: () => void;
 }
 
 const StudyContext = createContext<StudyContextType | null>(null);
 
 export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // Load initial states from localStorage
-  const [sessions, setSessions] = useState<StudySession[]>(() => StorageService.getSessions());
+  // Load initial states from localStorage with startup midnight/daily rollover check
+  const [initialData] = useState(() => {
+    const rawSessions = StorageService.getSessions();
+    const rawActive = StorageService.getActiveSession();
+    const now = new Date();
+    const rollover = processDailyRollover(rawActive, now);
+
+    let finalSessions = rawSessions;
+    let finalActive = rawActive;
+    let finalElapsed = 0;
+
+    if (rollover.hasRolledOver) {
+      if (rollover.archivedSessions.length > 0) {
+        for (const s of rollover.archivedSessions) {
+          finalSessions = StorageService.addSession(s);
+        }
+      }
+      finalActive = rollover.newActiveSession;
+      StorageService.saveActiveSession(finalActive);
+      finalElapsed = rollover.newElapsedMs;
+    } else {
+      if (rawActive.status === 'running' && rawActive.currentIntervalStart) {
+        finalElapsed = rawActive.accumulatedMs + Math.max(0, Date.now() - rawActive.currentIntervalStart);
+      } else {
+        finalElapsed = rawActive.accumulatedMs;
+      }
+    }
+
+    return {
+      sessions: finalSessions,
+      activeSession: finalActive,
+      initialElapsed: finalElapsed,
+      initialNotice: rollover.hasRolledOver ? (rollover.rolloverNotice || null) : null,
+    };
+  });
+
+  const [sessions, setSessions] = useState<StudySession[]>(initialData.sessions);
   const [settings, setSettings] = useState<UserSettings>(() => StorageService.getSettings());
-  const [activeSession, setActiveSession] = useState<ActiveSessionState>(() => StorageService.getActiveSession());
+  const [activeSession, setActiveSession] = useState<ActiveSessionState>(initialData.activeSession);
   const [selectedSubject, setSelectedSubject] = useState<string>(() => {
-    const saved = StorageService.getActiveSession();
-    return saved.subject || 'DSA';
+    return initialData.activeSession.subject || 'DSA';
   });
   const [sessionNotes, setSessionNotes] = useState<string>(() => {
-    const saved = StorageService.getActiveSession();
-    return saved.notes || '';
+    return initialData.activeSession.notes || '';
   });
 
   // Dynamic live elapsed time state
-  const [currentElapsedMs, setCurrentElapsedMs] = useState<number>(() => {
-    const saved = StorageService.getActiveSession();
-    if (saved.status === 'running' && saved.currentIntervalStart) {
-      return saved.accumulatedMs + Math.max(0, Date.now() - saved.currentIntervalStart);
-    }
-    return saved.accumulatedMs;
-  });
+  const [currentElapsedMs, setCurrentElapsedMs] = useState<number>(initialData.initialElapsed);
+  const [rolloverNotice, setRolloverNotice] = useState<string | null>(initialData.initialNotice);
 
   // Track current local date key for midnight detection
   const [currentDateStr, setCurrentDateStr] = useState<string>(() => formatLocalDateKey());
@@ -110,6 +141,46 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       return state.accumulatedMs + Math.max(0, nowMs - state.currentIntervalStart);
     }
     return state.accumulatedMs;
+  }, []);
+
+  // Daily Rollover handler for live midnights and reactivation
+  const checkDailyRollover = useCallback((referenceDate: Date = new Date()) => {
+    const todayKey = formatLocalDateKey(referenceDate);
+
+    setActiveSession(prevActive => {
+      const rollover = processDailyRollover(prevActive, referenceDate);
+      if (rollover.hasRolledOver) {
+        if (rollover.archivedSessions.length > 0) {
+          let updated = StorageService.getSessions();
+          for (const s of rollover.archivedSessions) {
+            updated = StorageService.addSession(s);
+          }
+          setSessions(updated);
+        }
+        StorageService.saveActiveSession(rollover.newActiveSession);
+        setCurrentElapsedMs(rollover.newElapsedMs);
+        if (rollover.rolloverNotice) {
+          setRolloverNotice(rollover.rolloverNotice);
+        }
+        setCurrentDateStr(todayKey);
+        return rollover.newActiveSession;
+      }
+      return prevActive;
+    });
+  }, []);
+
+  // Auto-dismiss rollover notice after 10 seconds
+  useEffect(() => {
+    if (rolloverNotice) {
+      const timer = setTimeout(() => {
+        setRolloverNotice(null);
+      }, 10000);
+      return () => clearTimeout(timer);
+    }
+  }, [rolloverNotice]);
+
+  const clearRolloverNotice = useCallback(() => {
+    setRolloverNotice(null);
   }, []);
 
   // Sync selectedSubject & notes into activeSession state if changed while idle
@@ -131,17 +202,29 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
 
     let lastTick = 0;
+    let lastHeartbeatSave = 0;
+
     const tick = (now: number) => {
       // Throttle state update to ~10 times per second for smooth rendering without overloading React
       if (now - lastTick >= 100) {
         lastTick = now;
         const nowMs = Date.now();
-        setCurrentElapsedMs(computeLiveElapsed(activeSession, nowMs));
+        const nowDate = new Date(nowMs);
+        const todayKey = formatLocalDateKey(nowDate);
 
         // Check if calendar day rolled over
-        const todayKey = formatLocalDateKey(new Date(nowMs));
         if (todayKey !== currentDateStr) {
-          setCurrentDateStr(todayKey);
+          checkDailyRollover(nowDate);
+          return;
+        }
+
+        setCurrentElapsedMs(computeLiveElapsed(activeSession, nowMs));
+
+        // Periodic heartbeat persistence every 4 seconds while running
+        if (now - lastHeartbeatSave >= 4000) {
+          lastHeartbeatSave = now;
+          const heartbeatSession = { ...activeSession, lastHeartbeat: nowMs };
+          StorageService.saveActiveSession(heartbeatSession);
         }
       }
       animationFrameRef.current = requestAnimationFrame(tick);
@@ -154,12 +237,13 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [activeSession, computeLiveElapsed, currentDateStr]);
+  }, [activeSession, computeLiveElapsed, currentDateStr, checkDailyRollover]);
 
   // Page visibility & focus listeners to ensure 100% accuracy after sleep or tab switch
   useEffect(() => {
     const handleReactivation = () => {
       const now = new Date();
+      checkDailyRollover(now);
       setCurrentDateStr(formatLocalDateKey(now));
       setCurrentElapsedMs(computeLiveElapsed(activeSession, now.getTime()));
     };
@@ -167,21 +251,21 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     window.addEventListener('focus', handleReactivation);
     document.addEventListener('visibilitychange', handleReactivation);
 
-    // Midnight rollover checker interval every 30 seconds
+    // Midnight rollover checker interval every 5 seconds
     const midnightInterval = setInterval(() => {
       const now = new Date();
       const todayKey = formatLocalDateKey(now);
-      if (todayKey !== currentDateStr) {
-        setCurrentDateStr(todayKey);
+      if (todayKey !== currentDateStr || (activeSession.status !== 'idle' && activeSession.sessionStartTime && formatLocalDateKey(new Date(activeSession.sessionStartTime)) !== todayKey)) {
+        checkDailyRollover(now);
       }
-    }, 30000);
+    }, 5000);
 
     return () => {
       window.removeEventListener('focus', handleReactivation);
       document.removeEventListener('visibilitychange', handleReactivation);
       clearInterval(midnightInterval);
     };
-  }, [activeSession, computeLiveElapsed, currentDateStr]);
+  }, [activeSession, computeLiveElapsed, currentDateStr, checkDailyRollover]);
 
   // Apply theme class to HTML element
   useEffect(() => {
@@ -214,6 +298,7 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       accumulatedMs: 0,
       intervals: [],
       notes: sessionNotes,
+      lastHeartbeat: now,
     };
 
     setActiveSession(newState);
@@ -242,6 +327,7 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       currentIntervalStart: null,
       accumulatedMs: newAccumulated,
       intervals: newIntervals,
+      lastHeartbeat: now,
     };
 
     setActiveSession(newState);
@@ -257,10 +343,18 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     if (activeSession.status !== 'paused') return;
     const now = Date.now();
 
+    // Verify it is still the same day before resuming
+    const todayKey = formatLocalDateKey(new Date(now));
+    if (activeSession.sessionStartTime && formatLocalDateKey(new Date(activeSession.sessionStartTime)) !== todayKey) {
+      checkDailyRollover(new Date(now));
+      return;
+    }
+
     const newState: ActiveSessionState = {
       ...activeSession,
       status: 'running',
       currentIntervalStart: now,
+      lastHeartbeat: now,
     };
 
     setActiveSession(newState);
@@ -269,7 +363,7 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     if (settings.soundEnabled) {
       soundFx.playStart();
     }
-  }, [activeSession, settings.soundEnabled]);
+  }, [activeSession, checkDailyRollover, settings.soundEnabled]);
 
   const finishTimer = useCallback((customNotes?: string): StudySession | null => {
     if (activeSession.status === 'idle') return null;
@@ -484,6 +578,8 @@ export const StudyProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     recentSessions,
     currentDateStr,
     refreshCalculations,
+    rolloverNotice,
+    clearRolloverNotice,
   };
 
   return <StudyContext.Provider value={value}>{children}</StudyContext.Provider>;

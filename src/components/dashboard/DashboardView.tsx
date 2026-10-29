@@ -8,19 +8,39 @@ import { GoalProgressBar } from './GoalProgressBar';
 import { WeeklyBarChart } from './WeeklyBarChart';
 import { SubjectBreakdownChart } from './SubjectBreakdownChart';
 import { RecentSessionsList } from './RecentSessionsList';
-import { Clock, CalendarDays, Award } from 'lucide-react';
+import { Clock, CalendarDays, Award, Sparkles, X } from 'lucide-react';
 
 interface DashboardViewProps {
   onNavigateHistory: () => void;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({ onNavigateHistory }) => {
-  const { todayStudyTimeMs, weekStudyTimeMs, monthStudyTimeMs } = useStudy();
+  const { todayStudyTimeMs, weekStudyTimeMs, monthStudyTimeMs, rolloverNotice, clearRolloverNotice } = useStudy();
 
   return (
     <div className="space-y-6">
       {/* Top Greeting and Today's Date */}
       <Header />
+
+      {/* New Day Auto-Saved Banner */}
+      {rolloverNotice && (
+        <div className="flex items-center justify-between gap-4 p-4 rounded-2xl bg-indigo-950/80 border border-indigo-500/40 text-indigo-200 text-sm shadow-xl backdrop-blur-md">
+          <div className="flex items-center gap-3">
+            <span className="p-2 rounded-xl bg-indigo-500/20 text-indigo-300">
+              <Sparkles className="w-4 h-4 text-amber-300" />
+            </span>
+            <span className="font-medium text-slate-100">{rolloverNotice}</span>
+          </div>
+          <button
+            type="button"
+            onClick={clearRolloverNotice}
+            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition-colors"
+            title="Dismiss notice"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Main Focus Study Timer */}
       <section aria-label="Study Timer">

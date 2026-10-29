@@ -206,8 +206,8 @@ export const StudyTimer: React.FC = () => {
         {/* Informative Microcopy */}
         <p className="mt-4 text-xs text-slate-500 text-center">
           {isRunning && "Active study time is being tracked. Paused breaks won't count."}
-          {isPaused && "Timer is paused. Take your break — no time is being added."}
-          {isIdle && "Session state persists across tab switches, refreshes, and reboots."}
+          {isPaused && "Timer is paused. Take your break — or finish session to save to history."}
+          {isIdle && "Timer starts from 00:00:00 every new day. Sessions auto-save at midnight."}
         </p>
       </div>
 

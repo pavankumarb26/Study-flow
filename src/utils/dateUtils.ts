@@ -1,4 +1,5 @@
 import { StudyInterval, StudySession, ActiveSessionState, DayStudySummary, SubjectStudySummary } from '../types/study';
+import { formatDurationHuman } from './formatters';
 
 /**
  * Returns 'YYYY-MM-DD' for a given Date in local time.
@@ -339,4 +340,198 @@ export function getSubjectBreakdown(
 
   // Sort descending by duration
   return results.sort((a, b) => b.durationMs - a.durationMs);
+}
+
+export interface RolloverResult {
+  hasRolledOver: boolean;
+  archivedSessions: StudySession[];
+  newActiveSession: ActiveSessionState;
+  newElapsedMs: number;
+  rolloverNotice?: string;
+}
+
+/**
+ * Checks if an active session belongs to a previous day (or spans across midnight).
+ * If so, automatically archives completed active time for previous day(s) into history,
+ * and resets or starts a fresh active session for the new day starting from 00:00:00.
+ */
+export function processDailyRollover(
+  activeSession: ActiveSessionState,
+  now: Date = new Date()
+): RolloverResult {
+  const nowMs = now.getTime();
+  const todayKey = formatLocalDateKey(now);
+  const { dayStart: todayStartMs } = getDayBoundaries(now);
+
+  // If idle or no start time, ensure clean idle state
+  if (activeSession.status === 'idle' || !activeSession.sessionStartTime) {
+    return {
+      hasRolledOver: false,
+      archivedSessions: [],
+      newActiveSession: activeSession,
+      newElapsedMs: 0,
+    };
+  }
+
+  const sessionStartKey = formatLocalDateKey(new Date(activeSession.sessionStartTime));
+
+  // If started today, no daily rollover needed
+  if (sessionStartKey === todayKey) {
+    const elapsed = activeSession.status === 'running' && activeSession.currentIntervalStart !== null
+      ? activeSession.accumulatedMs + Math.max(0, nowMs - activeSession.currentIntervalStart)
+      : activeSession.accumulatedMs;
+    return {
+      hasRolledOver: false,
+      archivedSessions: [],
+      newActiveSession: activeSession,
+      newElapsedMs: elapsed,
+    };
+  }
+
+  // Session was started on a previous day!
+  const archivedSessions: StudySession[] = [];
+  const sessionDayEnd = getDayBoundaries(new Date(activeSession.sessionStartTime)).dayEnd;
+
+  if (activeSession.status === 'paused') {
+    const durationMs = activeSession.accumulatedMs;
+    const lastIntervalEnd = activeSession.intervals.length > 0
+      ? activeSession.intervals[activeSession.intervals.length - 1].end
+      : (activeSession.lastHeartbeat || (activeSession.sessionStartTime + durationMs));
+
+    const effectiveEndTime = Math.min(lastIntervalEnd, sessionDayEnd);
+
+    if (durationMs >= 5000) {
+      archivedSessions.push({
+        id: `session_${activeSession.sessionStartTime}_${Math.random().toString(36).substring(2, 8)}`,
+        subject: activeSession.subject || 'DSA',
+        startTime: activeSession.sessionStartTime,
+        endTime: effectiveEndTime,
+        durationMs,
+        intervals: activeSession.intervals.length > 0
+          ? activeSession.intervals
+          : [{ start: activeSession.sessionStartTime, end: effectiveEndTime }],
+        notes: activeSession.notes
+          ? `${activeSession.notes} (Completed on ${sessionStartKey})`
+          : `Session from ${sessionStartKey}`,
+        createdAt: effectiveEndTime,
+      });
+    }
+
+    const newActive: ActiveSessionState = {
+      status: 'idle',
+      subject: activeSession.subject || 'DSA',
+      sessionStartTime: null,
+      currentIntervalStart: null,
+      accumulatedMs: 0,
+      intervals: [],
+      notes: '',
+      lastHeartbeat: undefined,
+    };
+
+    return {
+      hasRolledOver: true,
+      archivedSessions,
+      newActiveSession: newActive,
+      newElapsedMs: 0,
+      rolloverNotice: durationMs >= 5000
+        ? `New day started! Yesterday's session (${formatDurationHuman(durationMs)}) was saved to History. Timer has reset to 00:00:00.`
+        : `New day started! Timer has reset to 00:00:00.`,
+    };
+  }
+
+  // Status is 'running'
+  if (activeSession.status === 'running') {
+    const prevIntervals: StudyInterval[] = [];
+
+    for (const inv of activeSession.intervals) {
+      if (inv.end <= todayStartMs) {
+        prevIntervals.push(inv);
+      } else if (inv.start < todayStartMs) {
+        prevIntervals.push({ start: inv.start, end: todayStartMs });
+      }
+    }
+
+    const currentIntStart = activeSession.currentIntervalStart || activeSession.sessionStartTime;
+    const isLiveMidnight = (nowMs - todayStartMs) < 120000; // within 2 minutes of midnight live
+
+    if (currentIntStart < todayStartMs) {
+      const prevEnd = isLiveMidnight
+        ? todayStartMs
+        : (activeSession.lastHeartbeat
+            ? Math.min(activeSession.lastHeartbeat, todayStartMs)
+            : todayStartMs);
+
+      if (prevEnd > currentIntStart) {
+        prevIntervals.push({ start: currentIntStart, end: prevEnd });
+      }
+    }
+
+    const prevDurationMs = prevIntervals.reduce((sum, inv) => sum + Math.max(0, inv.end - inv.start), 0);
+
+    if (prevDurationMs >= 5000) {
+      archivedSessions.push({
+        id: `session_${activeSession.sessionStartTime}_${Math.random().toString(36).substring(2, 8)}`,
+        subject: activeSession.subject || 'DSA',
+        startTime: activeSession.sessionStartTime,
+        endTime: todayStartMs,
+        durationMs: prevDurationMs,
+        intervals: prevIntervals,
+        notes: activeSession.notes
+          ? `${activeSession.notes} (Completed at midnight)`
+          : `Session up to midnight (${sessionStartKey})`,
+        createdAt: todayStartMs,
+      });
+    }
+
+    if (isLiveMidnight) {
+      // Actively studying across midnight - continue running from 00:00:00 for today
+      const newActive: ActiveSessionState = {
+        status: 'running',
+        subject: activeSession.subject || 'DSA',
+        sessionStartTime: todayStartMs,
+        currentIntervalStart: todayStartMs,
+        accumulatedMs: 0,
+        intervals: [],
+        notes: activeSession.notes || '',
+        lastHeartbeat: nowMs,
+      };
+
+      return {
+        hasRolledOver: true,
+        archivedSessions,
+        newActiveSession: newActive,
+        newElapsedMs: Math.max(0, nowMs - todayStartMs),
+        rolloverNotice: `Midnight reached! Yesterday's time was saved to History. Today's timer started from 00:00:00.`,
+      };
+    } else {
+      // Closed yesterday while running and reopened today -> idle at 00:00:00
+      const newActive: ActiveSessionState = {
+        status: 'idle',
+        subject: activeSession.subject || 'DSA',
+        sessionStartTime: null,
+        currentIntervalStart: null,
+        accumulatedMs: 0,
+        intervals: [],
+        notes: '',
+        lastHeartbeat: undefined,
+      };
+
+      return {
+        hasRolledOver: true,
+        archivedSessions,
+        newActiveSession: newActive,
+        newElapsedMs: 0,
+        rolloverNotice: prevDurationMs >= 5000
+          ? `New day started! Yesterday's session (${formatDurationHuman(prevDurationMs)}) was saved to History. Timer is ready at 00:00:00.`
+          : `New day started! Timer has reset to 00:00:00.`,
+      };
+    }
+  }
+
+  return {
+    hasRolledOver: false,
+    archivedSessions: [],
+    newActiveSession: activeSession,
+    newElapsedMs: 0,
+  };
 }
